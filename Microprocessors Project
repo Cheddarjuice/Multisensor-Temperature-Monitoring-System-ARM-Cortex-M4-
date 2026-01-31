@@ -1,0 +1,684 @@
+; ============================================================================
+;   ARMCM4 MULTISENSOR TEMPERATURE MONITORING SYSTEM
+
+;Memory Blocks — Where the Chip Stores Things 
+
+;“Reserve this space for my variables.” 
+
+;Stack 
+;Used to store temporary values, return addresses, etc. 
+;Like a pile where functions keep their “notes” while working. 
+
+;AREA STACK, NOINIT, READWRITE, ALIGN=3 
+;SPACE 0x400   ; reserve 1 KB 
+; 
+
+;Sensor Settings 
+
+;This part defines configuration values in RAM: 
+
+;__config 
+;    DCB 80,40,0,0    ; Sensor 0: high=80, low=40 
+; 
+
+;Here each sensor gets: 
+;High threshold, Low threshold, (unused), (unused) 
+; 
+
+;Sensor Temperatures 
+;The “live” simulated readings. 
+
+;__sensors 
+;    DCB 40,40,40 
+; 
+;Sensor Alert State 
+;Stores whether each sensor is currently in an alert. 
+;0 = normal   
+;1 = in alert 
+; ============================================================================
+
+                PRESERVE8              ; Ensures the assembler maintains 8-byte 
+                                       ; stack alignment per AAPCS standard.
+
+                THUMB                  ; Emit ARM Thumb-2 instruction set.
+                                       ; Cortex-M4 executes only Thumb instructions.
+
+
+; ============================================================================
+;   CONSTANTS
+; ============================================================================
+Stack_Size      EQU     0x00000400     ; Size of stack = 1 KB
+Heap_Size       EQU     0x00000800     ; Size of heap = 2 KB
+
+NUM_SENSORS     EQU     3              ; Number of sensors in system.
+
+EVENT_COUNT     EQU     16             ; Event log circular buffer entries.
+
+SYST_CSR        EQU     0xE000E010     ; SysTick Control/Status register address.
+SYST_RVR        EQU     0xE000E014     ; SysTick Reload Value register address.
+
+
+; ============================================================================
+;   STACK & HEAP REGIONS (placed in RAM)
+; ============================================================================
+                AREA    STACK, NOINIT, READWRITE, ALIGN=3
+                                       ; AREA defines a memory section.
+                                       ; NOINIT = memory not zero-initialized.
+                                       ; ALIGN=3 enforces 2^3 = 8-byte alignment.
+
+Stack_Mem       SPACE   Stack_Size     ; Allocate stack block.
+__initial_sp                           ; Symbol marking the top of stack.
+
+
+                AREA    HEAP, NOINIT, READWRITE, ALIGN=3
+__heap_base
+Heap_Mem        SPACE   Heap_Size      ; Allocate heap block.
+__heap_limit
+
+
+; ============================================================================
+;   VECTOR TABLE — begins at address 0x00000000 in Cortex-M
+;The Vector Table — Like the Chip’s Phonebook 
+
+;The Cortex-M chip starts here when it powers on. 
+
+;Address 0: INITIAL STACK POINTER   
+;Address 4: RESET HANDLER   
+;Address 8: NMI handler   
+;Address C: HardFault handler   
+;... 
+;Address 2C: SysTick handler   
+; 
+
+;This table tells the processor: 
+
+;“If the SysTick timer fires, call SysTick_Handler.” 
+; ============================================================================
+                AREA    RESET, DATA, READONLY
+                EXPORT  __Vectors
+                EXPORT  Reset_Handler
+
+__Vectors       DCD __initial_sp        ; Initial stack pointer loaded into MSP.
+                DCD Reset_Handler       ; Reset exception vector.
+
+                ; Cortex-M exception vectors (mandatory positions)
+                DCD NMI_Handler
+                DCD HardFault_Handler
+                DCD 0                   ; MemManage (not implemented)
+                DCD 0                   ; BusFault
+                DCD 0                   ; UsageFault
+                DCD 0                   ; Reserved
+                DCD 0                   ; Reserved
+                DCD 0                   ; Reserved
+                DCD 0                   ; Reserved
+
+                DCD SVC_Handler         ; SVCall
+                DCD 0                   ; Debug
+                DCD 0                   ; Reserved
+                DCD PendSV_Handler      ; PendSV
+                DCD SysTick_Handler     ; SysTick ISR
+
+                SPACE (32 * 4)          ; Reserve space for IRQ table entries.
+
+__Vectors_End
+
+
+; ============================================================================
+;   DEFAULT HANDLERS — infinite loops
+; ============================================================================
+                AREA |.text|, CODE, READONLY
+
+NMI_Handler         B .                 ; B . = branch to itself (halt)
+HardFault_Handler   B .
+SVC_Handler         B .
+PendSV_Handler      B .
+Default_Handler     B .
+
+
+; ============================================================================
+;   RESET HANDLER — system startup entry point
+;Reset_Handler — The Program’s “Main” 
+
+;When the chip powers on, the first real code run is: 
+
+;Reset_Handler 
+;    BL Init_System 
+;    BL SysTick_Init 
+; 
+
+;Init_System 
+
+;This function: 
+
+;sets sensors to 50 
+
+;clears alert flags 
+
+;sets tick counter to 0 
+
+;sets event index to 0 
+
+;It “boots up” the monitoring system. 
+
+;SysTick_Init 
+
+;Configures the CPU to trigger an interrupt every 1 millisecond — like a heartbeat. 
+; ============================================================================
+Reset_Handler
+        BL Init_System                  ; Branch & Link = call Init_System()
+        BL SysTick_Init                 ; Initialize SysTick timer.
+
+Main_Loop
+        WFI                             ; Wait For Interrupt — reduces power.
+        B Main_Loop                     ; Infinite loop.
+
+
+
+; ============================================================================
+;   Init_System — initialize all variables, memory-mapped structures
+; ============================================================================
+Init_System
+        PUSH {R4-R7, LR}                ; Save registers and Link Register on stack.
+
+
+        ; Initialize event index pointer (circular buffer index)
+        LDR R0, =__event_index          ; Load address of event index.
+        MOVS R1, #0                     ; Set to zero.
+        STR R1, [R0]                    ; Store word to memory.
+
+
+        ; Initialize sensor temperatures (3 sensors)
+        LDR R0, =__sensors              ; Base of sensors array.
+        MOVS R1, #50                    ; Initial temperature = 50.
+
+        STRB R1, [R0], #1               ; STRB = byte store, post-increment.
+        STRB R1, [R0], #1
+        STRB R1, [R0]                   ; Last store, no increment.
+
+
+        ; Initialize alert state array (0 = not in alert)
+        LDR R0, =__state
+        MOVS R1, #0
+        STRB R1, [R0], #1
+        STRB R1, [R0], #1
+        STRB R1, [R0]                   ; 3 bytes.
+
+
+        ; Initialize tick counter to 0
+        LDR  R0, =__tick
+        MOVS R1, #0
+        STR  R1, [R0]
+
+
+        POP {R4-R7, LR}
+        BX LR                           ; Return to caller.
+
+
+
+; ============================================================================
+;   SysTick_Init — configure SysTick for 1ms interrupts
+;The SysTick Handler — The Heartbeat of the System 
+
+;This runs every 1 ms. 
+
+;Think of it like: 
+
+;“Every millisecond, check all sensors: 
+
+;update their simulated temperature 
+
+;compare against thresholds 
+
+;add events to the log 
+
+;update their alert status 
+
+;move to next sensor 
+
+;repeat forever 
+
+; ============================================================================
+SysTick_Init
+        PUSH {R4-R5, LR}
+
+        LDR R4, =SYST_RVR               ; SysTick Reload Register address.
+        LDR R0, =999                    ; Reload = 999 ? 1000 cycles.
+        STR R0, [R4]                    ; Write reload value.
+
+
+        LDR R5, =SYST_CSR               ; SysTick Control register.
+        MOVS R0, #7                     ; ENABLE | TICKINT | CLKSOURCE
+                                        ; bit0=1 enable counter
+                                        ; bit1=1 enable interrupt
+                                        ; bit2=1 use processor clock
+        STR  R0, [R5]
+
+
+        POP {R4-R5, LR}
+        BX LR
+
+
+
+; ============================================================================
+;   SysTick_Handler — main periodic sensor processing routine
+;   Runs every 1 ms
+; ============================================================================
+SysTick_Handler PROC
+        PUSH {R4-R11, LR}               ; Extend register save set.
+
+
+        ; Tick counter++
+        LDR  R0, =__tick                ; Load address of tick counter.
+        LDR  R1, [R0]                   ; Load its current value.
+        ADDS R1, R1, #1                 ; Increment.
+        STR  R1, [R0]                   ; Store new value.
+        MOV  R12, R1                    ; Save timestamp in R12 for events.
+
+
+        ; Setup loop variables
+        LDR  R4, =__sensors             ; R4 = sensor array base
+        MOVS R5, #0                     ; R5 = sensor index
+
+
+sensor_loop
+        CMP  R5, #NUM_SENSORS           ; Compare index to NUM_SENSORS
+        BGE  sensors_done               ; Exit loop if R5 >= 3.
+
+
+        ; Simulate drift for this sensor
+        BL   Sensor_Simulate            ; Returns updated temp in R0.
+        MOV  R9, R0                     ; Save temperature in R9.
+
+
+        ; Load threshold config for this sensor
+        LDR  R6, =__config              ; Base of config table.
+        ADD  R6, R6, R5, LSL #2         ; Multiply index*4 (4 bytes per sensor).
+        LDRB R7, [R6]                   ; High threshold.
+        LDRB R8, [R6, #1]               ; Low threshold.
+
+
+        ; Load current alert state
+        LDR  R10, =__state              ; Alert state array.
+        LDRB R11, [R10, R5]             ; R11 = alert flag.
+
+
+        ; ========================
+        ;   STATE MACHINE LOGIC
+        ; ========================
+
+        CMP  R11, #0                    ; Are we currently NOT in alert?
+        BEQ  state_normal               ; If R11==0, go to normal state test.
+
+
+        ; ----------------------------
+        ; Alert state: check for exit
+        ; ----------------------------
+        CMP  R9, R7                     ; temp > high threshold?
+        BHI  keep_alert                 ; Branch on Higher, Still too hot.
+
+        CMP  R9, R8                     ; temp < low threshold?
+        BLT  keep_alert                 ; Still too cold.
+
+
+        ; Temperature returned to normal ? clear alert
+        MOVS R11, #0
+        STRB R11, [R10, R5]             ; Clear alert state byte.
+
+        MOV  R0, R12                    ; timestamp ? R0
+        MOV  R1, R5                     ; sensor index ? R1
+        MOVS R2, #2                     ; event code = alert cleared
+        BL   Log_Event
+        B    next_sensor
+
+
+state_normal
+        ; Check for high-alert entry
+        CMP  R9, R7
+        BHI  alert_high
+
+        ; Check for low-alert entry
+        CMP  R9, R8
+        BLT  alert_low
+
+        B    next_sensor                ; Neither alert: continue.
+
+
+alert_high
+        MOVS R11, #1
+        STRB R11, [R10, R5]             ; Mark sensor as "in alert".
+
+        MOV  R0, R12                    ; timestamp
+        MOV  R1, R5                     ; sensor index
+        MOVS R2, #1                     ; GENERAL ALERT code
+        BL   Log_Event
+        B    next_sensor
+
+
+alert_low
+        MOVS R11, #1
+        STRB R11, [R10, R5]
+
+        MOV  R0, R12
+        MOV  R1, R5
+        MOVS R2, #1                     ; same alert code for high & low
+        BL   Log_Event
+        B    next_sensor
+
+
+keep_alert                                   ; Already in alert; nothing to log.
+
+
+next_sensor
+        ADDS R5, R5, #1                ; i++
+        B    sensor_loop
+
+
+sensors_done
+        POP  {R4-R11, LR}
+        BX   LR
+        ENDP
+
+
+
+; ============================================================================
+;   Sensor_Simulate — simulate temperature drift for sensor R5
+;Helper Routines 
+
+;Sensor_Simulate 
+
+;Creates artificial drift using a pseudo-random number. 
+;Temperature changes by ~ -20 to +10 each millisecond. 
+
+;PRNG_Byte 
+
+;Generates “random” numbers using bit-mixing. 
+
+;UDivMod11 
+
+;Reduces a number modulo 11. 
+
+;Log_Event 
+
+;Writes a 4-byte entry into a circular (ring) buffer. 
+
+;The event record is stored as: 
+
+;Byte 
+
+;Meaning 
+
+;0 
+
+;event code (1=alert high or low, 2=alert clear) 
+
+;1 
+
+;sensor index 
+
+;2 
+
+;timestamp low byte 
+
+;3 
+
+;timestamp high byte 
+
+;It loops automatically when full. 
+; ============================================================================
+Sensor_Simulate
+        ; Preserve registers. R3–R7 used internally.
+        PUSH {R4-R7, LR}
+
+
+        ; ------------------------------------------------------------
+        ; Load current temperature from __sensors[R5]
+        ; ------------------------------------------------------------
+        LDR R4, =__sensors             ; R4 = base address of sensor array
+        LDRB R3, [R4, R5]              ; R3 = byte at sensors[R5]
+                                       ; LDRB uses "register offset" addressing
+                                       ; R3 is now the current temperature (0-255)
+
+
+        ; ------------------------------------------------------------
+        ; Generate a random byte using the Xorshift PRNG
+        ; ------------------------------------------------------------
+        BL PRNG_Byte                   ; returns PRNG byte in R0
+        MOV R7, R0                     ; R7 = random value (0–255)
+
+
+        ; ------------------------------------------------------------
+        ; Convert PRNG byte to small drift
+        ;
+        ; We want drift in a *small range* so temperature is stable.
+        ; Step 1:  random mod 11   (? 0..10)
+        ; Step 2:  subtract 20     (? negative drift)
+        ; ------------------------------------------------------------
+        MOV R0, R7                     ; Copy PRNG byte into R0 for division
+        BL UDivMod11                   ; R0 = R0 mod 11 (0–10)
+
+        ; shift to NEGATIVE range :
+        ;   0 ? -20
+        ;   10 ? -10
+        SUBS R0, R0, #20               ; R0 is now drift in range [-20 .. -10]
+
+
+        ; ------------------------------------------------------------
+        ; Apply drift: new_temp = old_temp + drift
+        ; ------------------------------------------------------------
+        ADDS R3, R3, R0                ; signed addition, result in R3
+
+
+        ; ------------------------------------------------------------
+        ; Clamp temperature to [0 .. 255]
+        ; ------------------------------------------------------------
+        CMP R3, #0
+        BPL clip_upper                 ; if R3 >= 0 ? skip lower clamp
+        MOVS R3, #0                    ; floor clamp
+
+clip_upper
+        CMP R3, #255                   ; unsigned compare, because R3 = 0 now
+        BLE clip_done                  ; if <=255 ? OK
+        MOVS R3, #255                  ; ceiling clamp
+
+clip_done
+
+
+        ; ------------------------------------------------------------
+        ; Write updated temperature back to the sensor array
+        ; ------------------------------------------------------------
+        STRB R3, [R4, R5]              ; store byte back to memory
+        MOV R0, R3                     ; return updated temperature in R0
+
+
+        POP {R4-R7, LR}
+        BX LR
+
+
+
+
+; ============================================================================
+;   PRNG_Byte — Xorshift-based 8-bit pseudo random generator
+;
+;   PURPOSE:
+;       - fast, deterministic random byte for drift calculations
+;       - keeps only 1 byte of state in __prng
+;
+;   OUTPUT:
+;       R0 = new pseudo-random byte (0–255)
+;
+;   ALGORITHM (xorshift variant):
+;       x ^= x << 3
+;       x ^= x >> 5
+;       x ^= 0xB5     (nonlinear scramble constant)
+; ============================================================================
+PRNG_Byte
+        PUSH {R4, LR}
+
+
+        ; ------------------------------------------------------------
+        ; Load PRNG state byte from memory
+        ; ------------------------------------------------------------
+        LDR R0, =__prng                ; R0 = address of PRNG state
+        LDRB R1, [R0]                  ; R1 = current PRNG state byte
+
+
+        ; ------------------------------------------------------------
+        ; Perform Xorshift steps
+        ;
+        ; (1) R1 ^= (R1 << 3)
+        ; ------------------------------------------------------------
+        MOV R2, R1, LSL #3             ; R2 = R1 << 3
+        EOR R1, R1, R2                 ; R1 ^= R2
+
+
+        ; ------------------------------------------------------------
+        ; (2) R1 ^= (R1 >> 5)
+        ; ------------------------------------------------------------
+        MOV R3, R1, LSR #5             ; R3 = R1 >> 5
+        EOR R1, R1, R3                 ; R1 ^= R3
+
+
+        ; ------------------------------------------------------------
+        ; (3) R1 ^= 0xB5 — nonlinear constant scramble
+        ;
+        ; This makes the generator less predictable and avoids short 
+        ; cyclic patterns that happen in small xorshift systems.
+        ; ------------------------------------------------------------
+        EOR R1, R1, #0xB5
+
+
+        ; ------------------------------------------------------------
+        ; Store new PRNG state
+        ; ------------------------------------------------------------
+        STRB R1, [R0]                  ; write new seed to memory
+        MOV  R0, R1                    ; return R1 ? R0
+
+
+        POP {R4, LR}
+        BX LR
+
+; ============================================================================
+;   UDivMod11 — Compute R0 mod 11 via repeated subtraction
+;
+;   INPUT:
+;       R0 = unsigned integer (0–255 from PRNG)
+;
+;   OUTPUT:
+;       R0 = (R0 mod 11)
+;
+;   WHY?
+;       - Cortex-M0/M3/M4 **do not have hardware divide**
+;       - Modulo by a CONSTANT is much faster via subtraction
+;       - End result range = 0..10
+; ============================================================================
+UDivMod11
+        PUSH {R1, LR}
+
+        MOVS R1, #11                   ; divisor = 11
+
+
+mod_loop
+        CMP R0, R1                     ; is R0 < 11?
+        BLT done_mod                   ; if yes ? remainder found
+
+        SUBS R0, R0, R1                ; R0 = R0 - 11
+        B mod_loop                     ; repeat until remainder < 11
+
+
+done_mod
+        POP {R1, LR}
+        BX LR
+
+
+
+; ==============================================================
+; Log_Event — stores 4-byte event entry: 
+;   byte0 = event code
+;   byte1 = sensor index
+;   byte2 = timestamp low byte
+;   byte3 = timestamp high byte
+;
+; R0 = timestamp (32-bit but only low 16 bits logged)
+; R1 = sensor index
+; R2 = event code
+; ==============================================================
+
+Log_Event
+        PUSH {R4-R7, LR}
+
+        ; Load current write index (0–15)
+        LDR     R4, =__event_index
+        LDR     R5, [R4]               ; R5 = index
+
+        ; Compute event address = base + index*4
+        LDR     R6, =__event_log
+        ADD     R6, R6, R5, LSL #2     ; 4 bytes per entry
+
+
+        ; -------------------------------------------------------
+        ; Store event fields fully as BYTES (no alignment needed)
+        ; -------------------------------------------------------
+
+        ; byte 0 = event code
+        STRB    R2, [R6]
+
+        ; byte 1 = sensor index
+        STRB    R1, [R6, #1]
+
+        ; byte 2 = timestamp low byte
+        MOV     R7, R0                 ; copy timestamp
+        ANDS    R7, R7, #0xFF
+        STRB    R7, [R6, #2]
+
+        ; byte 3 = timestamp high byte
+        MOV     R7, R0
+        LSRS    R7, R7, #8             ; shift >> 8
+        ANDS    R7, R7, #0xFF
+        STRB    R7, [R6, #3]
+
+
+        ; -------------------------------------------------------
+        ; Update circular index
+        ; -------------------------------------------------------
+        ADDS    R5, R5, #1
+        CMP     R5, #EVENT_COUNT
+        BLT     Lno_wrap
+        MOVS    R5, #0
+
+Lno_wrap
+        STR     R5, [R4]
+
+        POP     {R4-R7, LR}
+        BX      LR
+
+; ============================================================================
+;   DATA SECTION — stored in RAM
+; ============================================================================
+
+__config
+        DCB 80,40,0,0                  ; Sensor0: high=80, low=40
+        DCB 100,45,0,0                 ; Sensor1: high=100, low=45
+        DCB 90,50,0,0                  ; Sensor2: high=90, low=50
+
+__sensors
+        DCB 50,50,50                   ; Initial sensor temperatures
+
+__state
+        DCB 0,0,0                      ; Alert states
+
+__prng
+        DCB 0xAB                       ; Initial PRNG seed
+
+
+                AREA MyData, DATA, READWRITE, ALIGN=4
+
+__tick           DCD 0                 ; Global tick counter
+__event_index    DCD 0                 ; Circular buffer index
+__event_log      SPACE EVENT_COUNT * 4 ; 16 events × 4 bytes each
+
+__dbg_index      DCB 0
+__dbg_buf        SPACE EVENT_COUNT
+
+        ALIGN 2
+        END
+;Terence Tang 
